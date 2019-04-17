@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/alauda/kube-ovn/pkg/ovs"
@@ -9,6 +10,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
+	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -61,13 +63,14 @@ type Controller struct {
 	// recorder is an event recorder for recording Event resources to the
 	// Kubernetes API.
 	recorder record.EventRecorder
+
+	informerFactory informers.SharedInformerFactory
+
+	leaderName *atomic.Value
 }
 
 // NewController returns a new ovn controller
-func NewController(
-	config *Configuration,
-	informerFactory informers.SharedInformerFactory) *Controller {
-
+func NewController(config *Configuration) *Controller {
 	// Create event broadcaster
 	// Add ovn-controller types to the default Kubernetes Scheme so Events can be
 	// logged for ovn-controller types.
@@ -77,6 +80,8 @@ func NewController(
 	eventBroadcaster.StartLogging(klog.Infof)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: config.KubeClient.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
+
+	informerFactory := kubeinformers.NewSharedInformerFactory(config.KubeClient, time.Second*30)
 
 	podInformer := informerFactory.Core().V1().Pods()
 	namespaceInformer := informerFactory.Core().V1().Namespaces()
@@ -116,7 +121,12 @@ func NewController(
 		updateEndpointQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "UpdateEndpoint"),
 
 		recorder: recorder,
+
+		leaderName: &atomic.Value{},
+
+		informerFactory: informerFactory,
 	}
+	controller.leaderName.Store("")
 
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    controller.enqueueAddPod,
@@ -161,6 +171,31 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 	// Start the informer factories to begin populating the informer caches
 	klog.Info("Starting OVN controller")
 
+	// leader election
+	setupLeaderElection(&leaderElectionConfig{
+		Client:     c.config.KubeClient,
+		ElectionID: "ovn-config",
+		OnStartedLeading: func(stopCh chan struct{}) {
+			c.setLeader(c.config.PodName)
+		},
+		OnStoppedLeading: func() {
+			c.setLeader("")
+		},
+		OnNewLeader: func(identity string) {
+			c.setLeader(identity)
+		},
+		PodName:      c.config.PodName,
+		PodNamespace: c.config.PodNamespace,
+	})
+	for {
+		klog.Info("waiting for a leader")
+		if c.hasLeader() {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	c.informerFactory.Start(stopCh)
+
 	// Wait for the caches to be synced before starting workers
 	klog.Info("Waiting for informer caches to sync")
 	if ok := cache.WaitForCacheSync(stopCh, c.podsSynced, c.namespacesSynced, c.nodesSynced, c.serviceSynced, c.endpointsSynced); !ok {
@@ -191,4 +226,15 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 	klog.Info("Shutting down workers")
 
 	return nil
+}
+
+func (c *Controller) setLeader(identity string) {
+	c.leaderName.Store(identity)
+}
+func (c *Controller) isLeader() bool {
+	return c.leaderName.Load().(string) == c.config.PodName
+}
+
+func (c *Controller) hasLeader() bool {
+	return c.leaderName.Load().(string) != ""
 }
